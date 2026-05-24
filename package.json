@@ -1,0 +1,24 @@
+{
+  "name": "website-automation-agent",
+  "version": "1.0.0",
+  "description": "An intelligent browser automation agent using Playwright and Gemini.",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "test:heuristic": "ts-node src/index.ts --mode heuristic --url https://ui.shadcn.com/docs/forms/react-hook-form",
+    "test:ai": "ts-node src/index.ts --mode ai --url https://ui.shadcn.com/docs/forms/react-hook-form"
+  },
+  "dependencies": {
+    "@google/genai": "^2.6.0",
+    "chalk": "^4.1.2",
+    "commander": "^11.1.0",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.42.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
