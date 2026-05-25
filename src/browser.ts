@@ -215,4 +215,29 @@ export class BrowserManager {
   public getPage(): Page | null {
     return this.page;
   }
+
+  // --- Strict Assignment Compliance Snake Case Aliases ---
+  public async open_browser(): Promise<Page> {
+    return this.openBrowser();
+  }
+
+  public async navigate_to_url(url: string): Promise<void> {
+    return this.navigateToUrl(url);
+  }
+
+  public async take_screenshot(filePath: string): Promise<string> {
+    return this.takeScreenshot(filePath);
+  }
+
+  public async click_on_screen(x: number, y: number): Promise<void> {
+    return this.clickOnScreen(x, y);
+  }
+
+  public async send_keys(text: string): Promise<void> {
+    return this.sendKeys(text);
+  }
+
+  public async double_click(x: number, y: number): Promise<void> {
+    return this.doubleClick(x, y);
+  }
 }
