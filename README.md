@@ -1,95 +1,197 @@
 # Website Automation Agent
 
-An intelligent, autonomous website automation agent capable of navigating web pages, scanning DOM layouts, rendering numbered interactive overlays, and filling out forms. 
+An intelligent website-automation agent built with **TypeScript + Playwright**. It opens a browser,
+**perceives** a page into a structured model, **decides** what to do, and **acts** — autonomously filling
+and submitting a form. A mini *Browser Use*, with a clean perceive → decide → act architecture.
 
-Designed for demonstration during viva voce, the project supports a **Dual-Execution Engine**:
-1. **AI-Driven Engine**: Uses visual screenshot reasoning and element lists with Gemini 2.5 Flash to dynamically make browser actions.
-2. **Heuristic Engine (Fallback)**: A rule-based scoring crawler that parses semantic fields and completes the target form task autonomously out-of-the-box, even without an LLM API key.
+> **Target task:** open <https://ui.shadcn.com/docs/forms/react-hook-form>, find the name/title and
+> description fields, fill them, and submit. The page renders **9 example forms**, so the agent must pick
+> the right one — it does this by *form-scoped role matching*, not by hardcoding field names. (The intended
+> form is the "Bug Report" demo: a **Bug Title** input + a **Description** textarea + a **Submit** button.)
 
----
-
-## Key Features
-
-* **Visual Element Badging**: Injects high-contrast numbered badges over interactable elements, matching screenshots.
-* **Micro-Click Animations**: Visual cursor ripple effect at target coordinates before clicking.
-* **Selector-Based Actions**: Combines visual coordinate tracking with stable selector-based execution to prevent failure on page reflows.
-* **Fail-Safe Robustness**: Try-catch wrapper around AI JSON parser that automatically delegates to Heuristic mode if parsing fails.
-* **Task Retries**: Retry logic wrapper with exponential backoff for network navigation, typing, and screenshot capture.
-* **Step-by-step Log Retention**: Saves full page screenshots per interaction step in `/screenshots`.
+✅ **Verified end-to-end:** both `npm run test:heuristic` and `npm run test:ai` (Groq) fill the correct form
+and submit, and the agent confirms the success toast (`"You submitted the following values: …"`). Exit code
+is `0` on confirmed success, non-zero otherwise.
 
 ---
 
-## Project Structure
+## Architecture: perceive → decide → act
 
 ```
-Website-Agent/
-├── src/
-│   ├── types.ts          # TypeScript interfaces (Elements, Actions, Log structures)
-│   ├── browser.ts        # Playwright browser manager (retries, click animations, selectors)
-│   ├── detector.ts       # DOM element extraction and badge overlays drawing
-│   ├── agent.ts          # Core execution loop orchestrator (AI and Heuristic Engine)
-│   └── index.ts          # CLI entry point (commander configuration)
-├── docs/
-│   └── architecture.md   # Architectural design document
-├── screenshots/          # Retention directory for interaction steps screenshots
-├── tsconfig.json         # TypeScript compiler configurations
-├── package.json          # Dependency and script manager
-├── .env.example          # Environment variables template
-└── .env                  # Environment variables config
+          ┌──────────────┐   PageSnapshot   ┌──────────────┐   Action[]   ┌──────────────┐
+  DOM ──▶ │  detector.ts │ ───────────────▶ │   planner    │ ───────────▶ │   agent.ts   │ ──▶ tools/ ──▶ page
+          │  (PERCEIVE)  │                  │  (DECIDE)    │              │   (ACT)      │
+          └──────────────┘                  └──────────────┘              └──────────────┘
+                                            heuristic | ai                JIT coordinate
+                                            (same interface)              resolution
+```
+
+The three layers are coupled **only** by typed contracts in [src/types.ts](src/types.ts)
+(`PageSnapshot`, `ElementInfo`, `Action`, `Goal`). The two planners implement one `Planner` interface, so
+switching brains (`--mode heuristic` ↔ `--mode ai`) is a single factory decision and the execution loop is
+identical. AI mode is itself **provider-agnostic** (Groq by default, Gemini optional) behind an `LlmClient`
+seam — see [AI mode](#ai-mode-provider-agnostic).
+
+---
+
+## The seven tools
+
+Composable primitives in [src/tools/](src/tools/). The agent builds **all** behaviour by sequencing them.
+`click_on_screen` and `double_click` are **genuine coordinate** mouse ops via Playwright `page.mouse`.
+
+| Tool | File | Notes |
+| --- | --- | --- |
+| `open_browser` | [tools/browser.ts](src/tools/browser.ts) | launch Chromium + context/page |
+| `navigate_to_url` | [tools/navigation.ts](src/tools/navigation.ts) | waits for network-idle (client-rendered) |
+| `take_screenshot` | [tools/screenshot.ts](src/tools/screenshot.ts) | viewport PNG into `output/` |
+| `click_on_screen(x, y)` | [tools/mouse.ts](src/tools/mouse.ts) | `page.mouse.click` |
+| `double_click(x, y)` | [tools/mouse.ts](src/tools/mouse.ts) | `page.mouse.dblclick` |
+| `send_keys` | [tools/keyboard.ts](src/tools/keyboard.ts) | types into the focused element |
+| `scroll` | [tools/scroll.ts](src/tools/scroll.ts) | direction-aware wheel scroll |
+
+Every tool is wrapped by `logger.step()`, so each call is timed and recorded in the audit trail.
+
+---
+
+## What makes it intelligent
+
+1. **Form-scoped perception.** [detector.ts](src/detector.ts) emits one record per element, each tagged
+   with a `data-agent-idx` (reused as a stable selector) and the **`formIndex`** of its owning `<form>`.
+2. **Role-based matching, not hardcoding.** The heuristic planner groups fields by form and fills two
+   roles — **primary** (single-line: name/title/subject…) and **description** (textarea preferred) — by
+   keyword **and** element shape. "Bug Title" satisfies the primary role without any form name being hardcoded.
+3. **Best-form selection.** Each form is scored on how completely and distinctly it fills both roles; the
+   best one wins (out of 9 here).
+4. **Submit may live outside the form.** If no submit button is inside the chosen `<form>`, the planner
+   picks the nearest qualifying button by **geometric proximity** to the fields (true on this page).
+5. **Just-in-time coordinate resolution.** Coordinates go stale after scrolling, so before every action the
+   agent re-resolves: selector → `scrollIntoViewIfNeeded` → **fresh** bounding box → centre → real click.
+6. **Purposeful `double_click`.** Used to focus a field and select existing content before retyping (not a
+   throwaway call); the `type` step relies on that focus.
+7. **Success verification.** After submit it waits for a sonner/radix toast or confirmation text and records
+   what it found.
+
+---
+
+## Project structure
+
+```
+src/
+  index.ts          # CLI: parse flags → build config → run agent
+  config.ts         # one typed config (.env defaults, CLI overrides)
+  logger.ts         # leveled console + structured run-log.json audit trail
+  types.ts          # PageSnapshot, ElementInfo, Action (union), Goal
+  detector.ts       # PERCEIVE: DOM → form-scoped snapshot
+  agent.ts          # ACT: loop + just-in-time coordinate resolution
+  tools/            # the 7 primitives + barrel
+  planners/         # DECIDE: Planner interface + Heuristic + AI + factory
+docs/architecture.md
 ```
 
 ---
 
-## Getting Started
+## Setup
 
-### Prerequisites
-Make sure you have [Node.js](https://nodejs.org/) installed.
-
-### 1. Installation
-Clone the repository and install the dependencies:
 ```bash
-# Install NPM packages
 npm install
-
-# Download Playwright Chromium browser binary
 npx playwright install chromium
 ```
 
-### 2. Configuration
-Copy the template `.env.example` to `.env`:
+Optional `.env` (the agent runs in heuristic mode with no config at all):
+
 ```bash
-cp .env.example .env
+cp .env.example .env   # set GROQ_API_KEY (or GEMINI_API_KEY) only if you want --mode ai
 ```
-Open `.env` and configure:
-* `GEMINI_API_KEY`: *(Optional)* Your Gemini API key from [Google AI Studio](https://aistudio.google.com/). If left empty, the agent automatically falls back to Heuristic Mode.
-* `HEADLESS`: Set to `false` to watch the browser actions live on your desktop.
-* `MAX_STEPS`: Max step iterations for the AI execution loop.
 
 ---
 
-## Running the Agent
+## Usage
 
-You can run the agent in either **Heuristic** or **AI** mode using the scripts defined in `package.json`:
-
-### Run in Heuristic Mode (Out-of-the-box reliable)
-Uses weighted DOM matching rules to complete the form filling.
 ```bash
-npm run test:heuristic
+npm run test:heuristic    # fill + submit the right form (no API key needed)
+npm run demo              # same, but visible window + slow-mo
+npm run test:ai           # AI planner (Groq by default; needs GROQ_API_KEY)
+npm test                  # offline unit tests for the AI JSON-validator (no key)
+npm run typecheck         # strict TS, passes clean
 ```
 
-### Run in AI Mode (Requires GEMINI_API_KEY)
-Uses multimodal screenshots + element lists to execute via Gemini.
+Direct CLI:
+
 ```bash
-npm run test:ai
+npx ts-node src/index.ts --mode heuristic --headless false -n "My Title" -d "My description"
 ```
 
-### Advanced Usage (CLI Commands)
-Run the CLI tool directly with custom options:
-```bash
-npx ts-node src/index.ts --mode heuristic --url https://ui.shadcn.com/docs/forms/react-hook-form --headless false
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `-m, --mode <m>` | `heuristic` or `ai` | `heuristic` |
+| `-p, --provider <p>` | AI backend: `groq` or `gemini` | `groq` |
+| `-u, --url <url>` | target URL | shadcn react-hook-form page |
+| `-n, --name <text>` | primary (name/title) value | `Automated Test Entry` |
+| `-d, --description <text>` | description value | a short default sentence |
+| `--headless [bool]` | headless browser (`--headless false` shows window) | `true` |
+| `--out <dir>` | output directory | `output` |
+| `--timeout <ms>` | navigation/element timeout | `45000` |
+| `--slowmo <ms>` | delay between ops (demos) | `0` |
+| `-v, --verbose` | debug logging | off |
+
+> There is intentionally **no `-h`** short flag — commander reserves it for `--help`.
+
+---
+
+## How it works (run sequence)
+
 ```
-* Options:
-  * `-m, --mode <mode>`: `ai` or `heuristic` (default: `heuristic`)
-  * `-u, --url <url>`: Navigation target URL
-  * `-h, --headless <boolean>`: Runs headless browser if set to `true` (default: `false`)
-  * `-s, --steps <number>`: Limit max step loop (default: `10`)
+open_browser → navigate_to_url → screenshot(loaded)
+  → perceive() → planner.plan(snapshot, goal)
+  → for each action: resolve fresh coords → tool → screenshot
+      double_click(title) → type(title) → double_click(desc) → type(desc) → click(submit) → wait
+  → verify success toast → screenshot(final) → flush run-log.json → close_browser
+```
+
+Heuristic mode returns the whole plan in one pass; AI mode loops perceive → plan → act until `done` or
+`--steps`. See [docs/architecture.md](docs/architecture.md) for the full design.
+
+---
+
+## Outputs (`output/`)
+
+- `NN-<action>.png` — a screenshot after every step (filmstrip)
+- `NN-final.png` — final state, showing the success toast ✅
+- `run-log.json` — structured audit trail: every tool call (timed), every action, and the verify result
+
+---
+
+## AI mode (provider-agnostic)
+
+Pick the LLM backend with `LLM_PROVIDER` (or `--provider`); both use Node's built-in `fetch`, **no SDKs**:
+
+| Provider | Endpoint | Default model | Key |
+| --- | --- | --- | --- |
+| **groq** (default) | OpenAI-compatible `chat/completions` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` (free at [console.groq.com](https://console.groq.com)) |
+| **gemini** | Google Generative Language REST (`x-goog-api-key` header) | `gemini-3.5-flash` | `GEMINI_API_KEY` |
+
+The planner builds one prompt (indexed element list + goal), asks the model for a JSON-array action plan, and
+**validates** the response — dropping unknown action types / out-of-range indices, tolerating code fences or a
+`{actions:[…]}` wrapper, and failing loudly on non-JSON. The validator has **offline unit tests**
+(`npm test`) so parsing is covered without any key.
+
+✅ **Verified live with Groq** (`llama-3.3-70b-versatile`): the model independently chose the Bug Title +
+Description + Submit elements, and the run confirmed the success toast. The model's action plan is recorded in
+`output/run-log.json`.
+
+Switch providers:
+```bash
+LLM_PROVIDER=gemini npm run test:ai
+# or: npx ts-node src/index.ts --mode ai --provider gemini
+```
+
+> The Gemini path is fully intact. Note: a Gemini key whose Google Cloud project lacks `generateContent`
+> quota returns HTTP 403/429 — use Groq (default) or a billing-enabled Gemini key.
+
+---
+
+## Troubleshooting
+
+- `Executable doesn't exist` → `npx playwright install chromium`.
+- AI mode error about a missing key → set `GROQ_API_KEY` (or `GEMINI_API_KEY` with `LLM_PROVIDER=gemini`), or use `--mode heuristic`.
+- Watch it live → `npm run demo` (or `--headless false`).

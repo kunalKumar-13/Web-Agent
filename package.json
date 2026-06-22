@@ -1,24 +1,28 @@
 {
   "name": "website-automation-agent",
-  "version": "1.0.0",
-  "description": "An intelligent browser automation agent using Playwright and Gemini.",
+  "version": "2.0.0",
+  "description": "An intelligent website automation agent (perceive → decide → act) built with TypeScript + Playwright.",
   "main": "dist/index.js",
   "scripts": {
-    "start": "ts-node src/index.ts",
     "build": "tsc",
-    "test:heuristic": "ts-node src/index.ts --mode heuristic --url https://ui.shadcn.com/docs/forms/react-hook-form",
-    "test:ai": "ts-node src/index.ts --mode ai --url https://ui.shadcn.com/docs/forms/react-hook-form"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --require ts-node/register src/planners/ai.test.ts",
+    "start": "ts-node src/index.ts",
+    "test:heuristic": "ts-node src/index.ts --mode heuristic",
+    "test:ai": "ts-node src/index.ts --mode ai",
+    "demo": "ts-node src/index.ts --mode heuristic --headless false --slowmo 250"
   },
   "dependencies": {
-    "@google/genai": "^2.6.0",
-    "chalk": "^4.1.2",
     "commander": "^11.1.0",
     "dotenv": "^16.4.5",
-    "playwright": "^1.42.1"
+    "playwright": "^1.49.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
     "ts-node": "^10.9.2",
-    "typescript": "^5.3.3"
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

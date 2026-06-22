@@ -1,95 +1,158 @@
-# Architecture Document - Website Automation Agent
+# Architecture — Website Automation Agent
 
-This document details the architectural design, component structure, and operational workflow of the **Website Automation Agent**.
+Design decisions, component responsibilities, and the end-to-end run sequence.
 
 ---
 
-## 1. System Overview
+## 1. The core idea: perceive → decide → act
 
-The Website Automation Agent is a modular, TypeScript-based browser automation program. It interacts with websites using two core execution loops:
-1. **AI-Driven Loop**: Captures screenshots, highlights interactive elements, and sends them to Gemini 2.5 Flash to make logical agent actions.
-2. **Heuristic Loop**: Operates on a semantic, weighted-scoring rule engine that parses DOM attributes (labels, placeholders, names, tags) to target specific form fields and submit them autonomously.
+The agent is three layers joined **only** by typed contracts in `src/types.ts`. Nothing else crosses the
+boundaries, which keeps each layer independently testable and replaceable.
 
 ```
-   ┌──────────────────────────────────────────────────────────┐
-   │                       CLI ENTRYPOINT                     │
-   │                        (src/index.ts)                    │
-   └─────────────────────────────┬────────────────────────────┘
-                                 │
-                   ┌─────────────┴─────────────┐
-                   ▼                           ▼
-        ┌─────────────────────┐     ┌─────────────────────┐
-        │       AI MODE       │     │   HEURISTIC MODE    │
-        │   (Gemini + Vision) │     │ (Weighted DOM Rules)│
-        └──────────┬──────────┘     └──────────┬──────────┘
-                   │                           │
-                   └─────────────┬─────────────┘
-                                 ▼
-                    ┌─────────────────────────┐
-                    │    AGENT ORCHESTRATOR   │
-                    │      (src/agent.ts)     │
-                    └────────────┬────────────┘
-                                 │
-        ┌────────────────────────┼────────────────────────┐
-        ▼                        ▼                        ▼
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│ BROWSER MGR  │         │   DETECTOR   │         │ VISUALBadges │
-│(src/browser) │         │(src/detector)│         │(src/detector)│
-└──────────────┘         └──────────────┘         └──────────────┘
+        PERCEIVE                         DECIDE                          ACT
+   ┌────────────────┐   PageSnapshot ┌────────────────┐  Action[]  ┌────────────────┐
+   │  detector.ts   │ ─────────────▶ │   Planner      │ ─────────▶ │   agent.ts     │
+   │  DOM → model   │                │  heuristic|ai  │            │  loop + JIT    │
+   └────────────────┘                └────────────────┘            └───────┬────────┘
+                                                                            │ sequences
+                                                                            ▼
+                                                                   ┌────────────────┐
+                                                                   │   tools/ (7)   │ ─▶ Chromium
+                                                                   └────────────────┘
 ```
 
----
-
-## 2. Core Modules & Component Responsibilities
-
-### 2.1 CLI Entry Point (`src/index.ts`)
-- Manages command-line argument parsing (target URL, headless/headed browser execution, maximum steps, and execution modes).
-- Resolves configuration and handles environment configuration loading (`dotenv`).
-- Automatically falls back from `AI` to `Heuristic` mode if the required `GEMINI_API_KEY` is not present in `.env`, ensuring out-of-the-box reliability.
-
-### 2.2 Browser Manager (`src/browser.ts`)
-- Wraps Playwright's Chromium control to expose modular browser actions:
-  - `openBrowser()` / `closeBrowser()`
-  - `navigateToUrl(url)`
-  - `takeScreenshot(path)`
-  - `clickOnScreen(x, y)` & `clickElement(selector)` (Supports coordinate-based and CSS selector-based clicking)
-  - `sendKeys(text)` & `typeInto(selector, text)` (Supports standard keyboard typing and element typing)
-  - `scroll(direction)`
-  - `doubleClick(x, y)`
-- **Robustness (Retries)**: Implements an exponential backoff retry utility `retry(fn, retries)` for network-bound and UI-bound tasks (navigation, screenshotting, and typing).
-- **Visual Micro-animations**: Injects a temporary red pulse cursor ripple directly at click coordinates on the webpage before executing clicks. This makes the execution highly visible and engaging in headed mode.
-
-### 2.3 Element Detector & Badge System (`src/detector.ts`)
-- Executes light DOM traversal inside the browser context to find all visible, interactable elements (`input`, `textarea`, `select`, `button`, `a`, elements with pointer cursors, etc.).
-- **Label Association**: Resolves field labeling by querying associated `<label>` tags (by ID, parent containers, or layout container structures like shadcn's form spacing classes).
-- **Visual Overlay System (`drawBadges()`)**: Injects numeric badge overlays directly on top of detected elements during screenshot capture. This translates the visual viewport state into indexed inputs for the multimodal AI model.
-
-### 2.4 Agent Orchestrator (`src/agent.ts`)
-#### The Heuristic Algorithm
-Computes weighted scores for all interactive DOM elements to target specific form controls:
-- **Name/Username**:
-  - `+30` if label matches `username`
-  - `+20` if label matches `name`
-  - `+25` / `+15` for placeholder matching
-  - `+20` / `+10` for attribute matching (id, name)
-- **Description**:
-  - `+10` if element is a `textarea` (preferred control)
-  - `+30` if label matches `description`/`desc`
-  - `+25` if label matches `bio`/`about`
-  - Similar weight bonuses for placeholders and names.
-- **Submit Button**:
-  - `+30` if button text contains `submit`
-  - `+20` if text matches `create`/`save`/`send`
-
-#### The AI Decision Loop
-- Prompts Gemini 2.5 Flash using multimodal inputs: the current badge-overlayed screenshot and a JSON list of detected elements.
-- Uses Gemini's JSON schema output configuration (`responseMimeType: "application/json"`) to receive structured actions.
-- Features parsing safeguards: if the AI returns malformed JSON, the execution immediately falls back to the Heuristic engine for that step to prevent crashes.
+**Contracts** (`types.ts`): `PageSnapshot` (perception), `ElementInfo` (one element, incl. `formIndex`,
+`box`, `selector`), `Action` (a discriminated union: `click | double_click | type | scroll | wait | done`),
+and `Goal`. The planners consume a snapshot + goal and return actions; the agent executes them.
 
 ---
 
-## 3. Design Decisions & Trade-offs
+## 2. Modules
 
-1. **Selector-based vs Coordinates-based Actions**: The agent supports both. While coordinates satisfy the baseline assignment spec and match the AI's visual reasoning, selector-based typing and clicking provide rock-solid reliability against network lag and page reflows.
-2. **TypeScript & modularity**: Using strict TypeScript ensures that elements, actions, and configurations conform to interfaces, making the code extremely readable, maintainable, and robust.
-3. **Chalk Logger**: Uses custom logging schemes (Thinking = Blue, Success = Green, Errors = Red, Actions = Cyan) to output an interactive, beautiful terminal log in real-time.
+### `index.ts` — CLI
+Parses flags with commander, builds the config, constructs the planner via the factory, and runs the agent.
+Exits non-zero if success can't be confirmed. No `-h` short flag (commander reserves it for `--help`), so
+headless is `--headless [bool]`.
+
+### `config.ts` — configuration
+One typed `AgentConfig`. Precedence: built-in defaults < `.env` (dotenv) < CLI flags. Output directory is
+resolved against `process.cwd()` — never an absolute machine path — so it works on any OS.
+
+### `logger.ts` — observability
+Leveled, colour-coded console output (raw ANSI, no dependency) **and** a structured audit trail. `step()`
+wraps each async tool call with timing + success/failure; `recordAction()` logs executed actions with their
+screenshot; `flush()` writes `output/run-log.json`.
+
+### `detector.ts` — PERCEIVE
+Runs in the browser via `page.evaluate` and returns a `PageSnapshot`. For each visible interactive element it:
+- writes a **`data-agent-idx`** attribute and uses `[data-agent-idx="N"]` as the element's stable selector,
+- records the **`formIndex`** (`closest('form')`) so fields can be reasoned about per-form,
+- resolves a label via `aria-labelledby` → `aria-label` → `label[for]` → wrapping `<label>` → shadcn
+  form-item container,
+- captures type/role/placeholder/name/text + a viewport-relative bounding box.
+
+Tagging the DOM with a stable index is what makes just-in-time coordinate resolution possible later.
+
+### `tools/` — ACT primitives
+The seven required tools, each wrapped in `logger.step`. `click_on_screen` / `double_click` are **genuine**
+`page.mouse` coordinate operations; `scroll` is a direction-aware `mouse.wheel`; `send_keys` types into the
+focused element (with a `pressKey` helper for select-all). A barrel re-exports them.
+
+### `planners/` — DECIDE
+- `planner.ts` — the `Planner` interface: `plan(snapshot, goal) => Promise<Action[]>`.
+- `heuristic.ts` — deterministic, form-scoped role matcher (below).
+- `ai.ts` — Gemini via REST (below).
+- `factory.ts` — chooses the planner from config (the only place the engine is selected).
+
+### `agent.ts` — ACT orchestration
+Owns the perceive → decide → act loop, just-in-time coordinate resolution, per-step screenshots, success
+verification, and error handling.
+
+---
+
+## 3. Heuristic algorithm (form-scoped, role-based)
+
+1. **Score roles** for every element:
+   - *primary* (single-line text input): `+30/14/12` for name/title/subject/summary/username/headline in
+     label/placeholder/name; `+2` base so any text input can serve.
+   - *description* (`<textarea>` `+20` base, else text input `0`): `+30/14/12` for
+     description/message/details/comment/body/about/bio/… in label/placeholder/name.
+   - *submit* (button): `+30` "submit", `+18` save/send/create/…, `+20` `type=submit`; negatives
+     (reset/cancel/clear/…) score `0` so the bug-report **Reset** button is never chosen.
+2. **Group by `formIndex`** and pick the form that best fills **both** roles (distinct elements), with a
+   bonus when both are present.
+3. **Find submit:** prefer a submit inside the chosen form; otherwise the nearest qualifying button **below**
+   the fields by geometric proximity (on this page the submit lives *outside* the `<form>`).
+4. **Emit actions:** optional `scroll` if the form is below the fold, then per field
+   `double_click` (focus + select) → `type`, then `click` submit → `wait` → `done`.
+
+No specific form or field name is hardcoded — selection is purely by keyword + shape + geometry.
+
+## 4. AI planner (REST, validated)
+
+Serialises the indexed element list (`idx`, tag, type, role, label, placeholder, name, text, `formIndex`) +
+the goal into a prompt and calls the Gemini REST endpoint with Node's built-in `fetch`
+(`responseMimeType: application/json`, `temperature: 0`) — **no SDK dependency**. The response is parsed and
+**validated**: each item must use a known action type with an in-range `idx`; invalid items are dropped and a
+non-JSON response throws. It returns the same `Action[]` the agent executes for the heuristic planner.
+
+---
+
+## 5. Just-in-time coordinate resolution (the key reliability trick)
+
+Coordinates captured during perception are viewport-relative and go stale the instant the page scrolls or
+reflows. So `agent.ts` never reuses snapshot coordinates for the actual click. For every targeted action:
+
+```
+idx ──▶ selector ([data-agent-idx]) ──▶ locator.scrollIntoViewIfNeeded()
+    ──▶ fresh locator.boundingBox() ──▶ centre (x, y) ──▶ page.mouse click/dblclick at (x, y)
+```
+
+Typing reuses the focus from the preceding `double_click` (purposeful), falling back to a coordinate click if
+the field isn't focused, then select-all + `send_keys`.
+
+---
+
+## 6. End-to-end run sequence
+
+```
+open_browser
+  → navigate_to_url → screenshot(01-loaded)
+  → perceive() ──────────────── PageSnapshot (80 elements, 9 forms)
+  → planner.plan() ──────────── Action[]
+  → execute each (JIT resolve → tool → screenshot):
+       scroll → double_click(title) → type(title)
+              → double_click(desc)  → type(desc)
+              → click(submit) → wait → done
+  → verify() ────────────────── success toast text captured
+  → screenshot(final) → flush run-log.json → close_browser
+```
+
+On any failure the agent captures an `error` screenshot, flushes the audit trail, and the process exits
+non-zero.
+
+---
+
+## 7. Design decisions & trade-offs
+
+1. **Form-scoped over global scoring** — the single most important correctness decision; it keeps the name
+   and description in the *same* form and is why the agent picks the right one out of nine.
+2. **One `Planner` interface for both engines** — heuristic for zero-setup reliability and as a deterministic
+   safety net; AI for generality. The execution loop never changes between them.
+3. **REST + `fetch` for Gemini, no SDK** — model SDKs churn and have shipped broken lockfiles; a thin REST
+   call keeps dependencies to `playwright`, `commander`, `dotenv` only.
+4. **Stable `data-agent-idx` selectors + JIT resolution** — robust against scroll/reflow without sacrificing
+   genuine coordinate-based clicking.
+5. **Audit trail + step filmstrip** — colour logs for a live demo; `run-log.json` + per-step screenshots for
+   an auditable record.
+
+## 8. Pitfalls explicitly avoided
+
+- No hardcoded paths (output resolves against `process.cwd()`).
+- No `-h` flag (collides with `--help`); headless is `--headless [bool]`.
+- `scroll` respects direction; the AI planner is offered `double_click` and direction-aware `scroll` and
+  parses them.
+- Fields are scored **per form**, not globally.
+- No SDK/unpublished deps for the model.
+- The default description stays within the page's 100-character limit so submission validates.

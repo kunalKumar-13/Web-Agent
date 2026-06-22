@@ -1,6 +1,7 @@
 node_modules/
 dist/
-.env
+output/
 screenshots/
+.env
 *.log
 .DS_Store

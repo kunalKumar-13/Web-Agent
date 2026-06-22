@@ -1,64 +1,76 @@
+/**
+ * CLI entry point: parse flags → build config → run the agent.
+ *
+ * Flags (all also settable via .env; CLI wins):
+ *   -m/--mode, -u/--url, -n/--name, -d/--description,
+ *   --headless [bool], --out, --timeout, --slowmo, -v/--verbose
+ *
+ * Note: there is intentionally NO `-h` short flag — commander reserves it for
+ * --help, so headless is the long `--headless` only.
+ */
 import { Command } from 'commander';
 import * as dotenv from 'dotenv';
-import * as path from 'path';
-import chalk from 'chalk';
-import { AgentOrchestrator } from './agent';
-import { AgentConfig } from './types';
-
-// Load environment variables from .env file
 dotenv.config();
 
-const program = new Command();
+import { buildConfig } from './config';
+import { createPlanner } from './planners/factory';
+import { Agent } from './agent';
+import * as logger from './logger';
 
+const program = new Command();
 program
-  .name('website-automation-agent')
-  .description('An intelligent, autonomous website automation agent using Playwright.')
-  .version('1.0.0')
-  .option('-m, --mode <mode>', 'Execution mode: "ai" or "heuristic"', 'heuristic')
-  .option('-u, --url <url>', 'Target URL to automate', 'https://ui.shadcn.com/docs/forms/react-hook-form')
-  .option('-h, --headless <boolean>', 'Run browser in headless mode (true/false)', 'false')
-  .option('-s, --steps <number>', 'Maximum steps for AI loop', '10')
+  .name('web-agent')
+  .description('Intelligent website automation agent (perceive → decide → act)')
+  .version('2.0.0')
+  .option('-m, --mode <mode>', 'engine: heuristic | ai')
+  .option('-p, --provider <p>', 'AI provider: groq | gemini')
+  .option('-u, --url <url>', 'target URL')
+  .option('-n, --name <text>', 'value for the name/title field')
+  .option('-d, --description <text>', 'value for the description field')
+  .option('--headless [bool]', 'run headless (default true; "--headless false" shows the window)')
+  .option('--out <dir>', 'output directory for screenshots + run-log.json')
+  .option('--timeout <ms>', 'navigation / element timeout in ms')
+  .option('--slowmo <ms>', 'delay between browser ops (useful for demos)')
+  .option('-v, --verbose', 'verbose (debug) logging')
   .parse(process.argv);
 
-const options = program.opts();
+const opts = program.opts();
 
-// Determine configuration
-const headless = options.headless === 'true';
-const mode = (options.mode === 'ai' || options.mode === 'heuristic') ? options.mode : 'heuristic';
-const url = options.url;
-const maxSteps = parseInt(options.steps, 10) || 10;
+const config = buildConfig({
+  mode: opts.mode,
+  provider: opts.provider,
+  url: opts.url,
+  name: opts.name,
+  description: opts.description,
+  headless: opts.headless, // true (bare flag) or "true"/"false" string or undefined
+  out: opts.out,
+  timeout: opts.timeout !== undefined ? Number(opts.timeout) : undefined,
+  slowmo: opts.slowmo !== undefined ? Number(opts.slowmo) : undefined,
+  verbose: Boolean(opts.verbose),
+});
 
-const config: AgentConfig = {
-  headless,
-  mode,
-  maxSteps,
-  url,
-};
+async function main(): Promise<void> {
+  logger.setVerbose(config.verbose);
+  logger.banner('WEBSITE AUTOMATION AGENT');
+  logger.summary({
+    Mode: config.mode.toUpperCase(),
+    ...(config.mode === 'ai' ? { Provider: config.provider } : {}),
+    URL: config.url,
+    Headless: String(config.headless),
+    Name: config.name,
+    Output: config.outDir,
+  });
+  logger.setMeta({ mode: config.mode, provider: config.provider, url: config.url, headless: config.headless });
 
-async function main() {
-  console.log(chalk.bold.magenta('\n============================================='));
-  console.log(chalk.bold.magenta('        WEBSITE AUTOMATION AGENT             '));
-  console.log(chalk.bold.magenta('=============================================\n'));
+  const planner = createPlanner(config);
+  const agent = new Agent(config, planner);
+  const result = await agent.run();
 
-  // If AI mode is requested, check if API key exists. If not, auto-toggle to heuristic.
-  if (config.mode === 'ai' && (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY.trim() === '')) {
-    console.log(chalk.yellow('[NOTICE] GEMINI_API_KEY is not defined in your .env file.'));
-    console.log(chalk.yellow('[NOTICE] Automatically fallback to HEURISTIC mode for out-of-the-box reliability.\n'));
-    config.mode = 'heuristic';
-  }
-
-  console.log(chalk.cyan(`Configured Mode:   ${chalk.bold(config.mode.toUpperCase())}`));
-  console.log(chalk.cyan(`Target URL:        ${chalk.bold(config.url)}`));
-  console.log(chalk.cyan(`Headless:          ${chalk.bold(config.headless.toString())}`));
-  console.log(chalk.cyan(`Max Steps (AI):    ${chalk.bold(config.maxSteps.toString())}`));
-  console.log(chalk.gray('---------------------------------------------\n'));
-
-  const orchestrator = new AgentOrchestrator(config);
-  await orchestrator.run();
+  // Exit non-zero if we could not confirm the task succeeded.
+  process.exit(result.success ? 0 : 1);
 }
 
 main().catch((err) => {
-  console.error(chalk.red('Fatal execution error:'));
-  console.error(err);
+  logger.log.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });
